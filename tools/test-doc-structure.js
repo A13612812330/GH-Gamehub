@@ -1,0 +1,400 @@
+/* test-doc-structure.js —— 文档结构闸（静态防线，登记在 run-all.js 的 SUITES）
+ *
+ * ★ 为什么需要它（v10.39 实测事故）：
+ *   v10.36 提交把**整份 `WORKFLOW.md`** 插进了「已完成」表那条 v10.36 长行的**中间** ——
+ *   752 行里 336 行是整份副本、表行被劈成两半、**连文档标题都被挤进了表行末尾**。
+ *   这个状态**在仓库里活了 3 个版本**（v10.36 / v10.37 / v10.38）没人发现，因为：
+ *     · Markdown 渲染正常（重复段落只是重复显示，不报错）
+ *     · 所有断言套件都不看 `.md`
+ *     · `git diff` 看起来只是"改了一行"
+ *   ⇒ 静态断言套件只能守住**它已知的**东西；文档从没被守过，所以它怎么坏都没人知道。
+ *
+ * 本闸守三件事（都是「坏了不报错」的形态）：
+ *   ① **一级标题唯一** —— 整份被复制 ⇒ 标题出现 2 次
+ *   ② **任意偏移下不存在大段重复**（偏移比对）—— 这是抓「整份被插入」的通法，
+ *      不依赖标题：副本可能被插在**任何一行中间**，连标题都被吞掉
+ *   ③ **章节标题唯一** —— 局部重复（某个小节被复制两遍）
+ *
+ * ⚠️ 判据是「重复的**行内容**占比」，不是「文件变大了」——
+ *    文档本来就允许出现重复的表格分隔行（`|---|---|`），所以只统计**非平凡行**（trim 后长度 ≥ 12）。
+ *
+ * 用法：node tools/test-doc-structure.js
+ * 退出码：0 = 全通过与；1 = 有失败
+ */
+const fs = require('fs');
+const path = require('path');
+
+const ROOT = path.join(__dirname, '..');
+
+/* ---------- 断言助手（只数条数、打印，run-all 取末行「通过 n/m」） ---------- */
+let pass = 0, fail = 0;
+const okList = [], badList = [];
+function ok(cond, name) {
+  if (cond) { pass++; okList.push('  PASS  ' + name); }
+  else { fail++; badList.push('  FAIL  ' + name); }
+}
+
+/* ---------- 门槛（实测标定，见文件末「标定依据」） ---------- */
+const MIN_LINE = 12;       // 非平凡行的最小长度
+const MAX_COPY_RATIO = 0.6; // 偏移比对：重复占比 ≥ 此值即判「整段副本」
+const MIN_OVERLAP = 60;    // 偏移后至少要重叠这么多行才参与判定（避免尾部短重叠误报）
+
+/* 待守的文档：根目录 + `docs/versions/` 的全部 .md
+ * ★ 用「枚举实际文件」而不是手写清单，因为新增文档时必须自动被覆盖
+ *   （这正是本闸要防的「新增了没人守」）。
+ * ★ v10.40：39 份版本日志从根目录迁到 `docs/versions/` —— 若这里仍只扫根目录，
+ *   它们会**整体掉出守护范围且不报错**（正是本闸存在的理由）。 */
+const DOC_DIRS = ['', 'docs/versions'];
+const docs = [];   // [{ rel, abs }]
+for (const d of DOC_DIRS) {
+  const abs = path.join(ROOT, d);
+  if (!fs.existsSync(abs)) continue;
+  for (const f of fs.readdirSync(abs).filter((x) => /\.md$/i.test(x)).sort()) {
+    docs.push({ rel: d ? d + '/' + f : f, abs: path.join(abs, f) });
+  }
+}
+const LOG_DIR = 'docs/versions';
+const RE_VER_LOG = /^v10\.(\d+)\.md$/;
+
+console.log('=== 文档结构闸（v10.39 新增 / v10.40 扩到 docs/versions）===');
+console.log('扫描 .md：' + docs.length + ' 个（根目录 ' + docs.filter((d) => !d.rel.includes('/')).length +
+  ' + ' + LOG_DIR + ' ' + docs.filter((d) => d.rel.startsWith(LOG_DIR + '/')).length + '）');
+console.log('门槛：非平凡行 ≥ ' + MIN_LINE + ' 字 · 偏移重复占比 ≥ ' + (MAX_COPY_RATIO * 100) + '% 判为副本 · 最小重叠 ' + MIN_OVERLAP + ' 行');
+console.log('');
+
+/* ---------- 标题抽取：★ 必须跳过围栏代码块 ----------
+ * 实测假红（2026-09-24，首次运行时 9 条 FAIL 全是这一类）：
+ *   代码块里的 `# 或手动：kill 掉 8123 → node server.js`（bash 注释）、
+ *   ``` 块里的提交信息 `# 返回体新增 bothOnly 字段` —— 都被当成了 Markdown 一级标题。
+ *   WORKFLOW.md 因此被算成「24 个一级标题」、README.md 被算成 2 个。
+ * ⇒ 只统计**围栏之外**的 `#` 行。 */
+function headingsOf(lines) {
+  const out = [];
+  let fence = null; // null=不在块内；否则记下起始标记（``` 或 ~~~）
+  lines.forEach((raw, i) => {
+    const t = raw.trim();
+    const f = /^(`{3,}|~{3,})/.exec(t);
+    if (f) {
+      const mark = f[1][0];
+      if (fence === null) fence = mark;
+      else if (fence === mark) fence = null;
+      return;
+    }
+    if (fence !== null) return;
+    const m = /^(#{1,6})\s+(.+?)\s*$/.exec(t);
+    if (m) out.push({ lv: m[1].length, t: m[2], ln: i + 1 });
+  });
+  return out;
+}
+
+/* ---------- 标题路径：`## A` 下的 `### X` 与 `## B` 下的 `### X` 不算重复 ----------
+ * 实测假红：docs/versions/v10.5.md 有 `### 修法` ×3、v10.32.md 有 `### 改法` ×2、
+ * README.md 有 `### 验证/修法/防线` 各 ×2 —— 它们各自的父节不同，**是合法结构**。
+ * 真正该报的是「同一父节下出现两个同名子节」（那才是复制粘贴事故的形态）。 */
+function headingPaths(heads) {
+  const paths = [];
+  const stack = []; // 索引 = 层级-1
+  for (const h of heads) {
+    stack.length = h.lv - 1;
+    for (let i = 0; i < h.lv - 1; i++) if (stack[i] == null) stack[i] = '(未命名)';
+    stack[h.lv - 1] = h.t;
+    paths.push({ p: stack.slice(0, h.lv).join(' > '), ln: h.ln, lv: h.lv, t: h.t });
+  }
+  return paths;
+}
+
+
+/* ---------- 剥掉「代码里的伪链接」 ----------
+ * ★ 实测假红：docs/versions/README.md 在表格里用**行内代码**演示「根目录该怎么写链接」
+ *   （`` `[v10.39](docs/versions/v10.39.md)` ``），闸把它当真链接去解析 ⇒ 必然找不到。
+ *   代码段里的 `](…)` 是**示例**、不是链接，与「围栏里的 `#` 不是标题」同一类问题。 */
+function stripCode(src) {
+  const out = [];
+  let fence = null;
+  for (const raw of src.split(/\r?\n/)) {
+    const t = raw.trim();
+    const f = /^(`{3,}|~{3,})/.exec(t);
+    if (f) {
+      const mark = f[1][0];
+      if (fence === null) fence = mark;
+      else if (fence === mark) fence = null;
+      out.push('');
+      continue;
+    }
+    out.push(fence !== null ? '' : raw.replace(/`[^`]*`/g, ' '));
+  }
+  return out.join('\n');
+}
+
+const findings = [];
+
+/* 显式例外：允许出现 >1 个一级标题的文件 + 理由。
+ * ★ 与 check-card-rules.js 的例外表同思路，并**自检陈旧**：
+ *   登记了但实际已不超标的，也报错 —— 避免例外表退化成「静默跳过」。
+ *
+ * ★ v10.100：条目清空。原先登记的两份（`HANDOFF.md` / `CODEX-HANDOFF.md`，各带一个归档头，
+ *   所以是 2 个 H1）已迁到 `docs/archive/`，而本闸只扫根目录与 `docs/versions/` ⇒ 它们
+ *   不再进入扫描范围，例外自动失效。留空表而不是删掉机制：下次真有文档需要放宽时，
+ *   「陈旧自检」这条会立刻提醒登记与清理。 */
+const H1_EXCEPTIONS = [];
+const staleExceptions = [];
+
+for (const d of docs) {
+  const f = d.rel;
+  const raw = fs.readFileSync(d.abs, 'utf8');
+  const lines = raw.split(/\r?\n/);
+  const n = lines.length;
+  const label = f + '（' + n + ' 行）';
+
+  const heads = headingsOf(lines);
+  const h1Max = H1_EXCEPTIONS.some((e) => e.file === f) ? 2 : 1;
+
+  /* ① 一级标题恰好 1 个（归档文档放宽到 2；0 个也算不合格：文档没有标题） */
+  const h1 = heads.filter((h) => h.lv === 1);
+  ok(h1.length === 1 || (h1.length === h1Max && h1Max === 2),
+    '[' + f + '] 一级标题 ' + (h1Max === 2 ? '≤2（归档例外）' : '恰好 1') + ' 个（实测 ' + h1.length +
+    (h1.length !== 1 && h1Max === 1 ? '：' + h1.map((h) => 'L' + h.ln + ' ' + h.t.slice(0, 40)).join(' / ') : '') + '）');
+
+  /* ② 偏移比对：抓「整段副本被插进任意位置」——
+   * 这是本闸的主力判据：它**不依赖标题**，所以连「标题被吞进行尾」那种事故也能抓到。 */
+  const nt = (i) => lines[i].trim().length >= MIN_LINE;
+  let worst = { s: 0, ratio: 0, overlap: 0, tot: 0, hit: 0 };
+  for (let s = 1; s < n; s++) {
+    const overlap = n - s;
+    if (overlap < MIN_OVERLAP) break;
+    let tot = 0, hit = 0;
+    for (let i = 0; i < overlap; i++) {
+      if (nt(i) || nt(s + i)) { tot++; if (lines[i].trim() === lines[s + i].trim()) hit++; }
+    }
+    if (tot < MIN_OVERLAP) continue;
+    const ratio = hit / tot;
+    if (ratio > worst.ratio) worst = { s, ratio, overlap, tot, hit };
+  }
+  const isDup = worst.ratio >= MAX_COPY_RATIO;
+  ok(!isDup, '[' + f + '] 无「整段副本」（最高偏移重复 ' + (worst.ratio * 100).toFixed(1) +
+    '% @ 偏移 ' + worst.s + ' 行' + (isDup ? ' ⇒ ★ 疑似整份/大段被复制到此偏移处' : '') + '）');
+  if (isDup) {
+    findings.push('  · ' + label + '：偏移 ' + worst.s + ' 行处重复占比 ' + (worst.ratio * 100).toFixed(1) +
+      '%（' + worst.hit + '/' + worst.tot + ' 个非平凡行）⇒ 疑似整份文档被插入此处');
+  }
+
+  /* ③ 标题路径唯一（不是「标题文本唯一」—— 同名子节挂在不同父节下是合法的） */
+  const paths = headingPaths(heads);
+  const byPath = {};
+  for (const p of paths) (byPath[p.p] = byPath[p.p] || []).push(p.ln);
+  const dupPaths = Object.entries(byPath).filter(([, arr]) => arr.length > 1);
+  ok(dupPaths.length === 0, '[' + f + '] 标题路径无重复（共 ' + heads.length + ' 个标题 / ' + paths.length + ' 条路径' +
+    (dupPaths.length ? '，重复：' + dupPaths.map(([k, arr]) => k + ' ×' + arr.length + '（L' + arr.join('/L') + '）').join('；') : '') + '）');
+  for (const [k, arr] of dupPaths) findings.push('  · ' + label + '：同一父节下重复 ' + arr.length + ' 次 —— ' + k + '（L' + arr.join(' / L') + '）');
+}
+
+/* 例外表自检：登记了但实际已不超标 ⇒ 报错（防止例外表退化成静默跳过） */
+for (const e of H1_EXCEPTIONS) {
+  const p = path.join(ROOT, e.file);
+  if (!fs.existsSync(p)) { staleExceptions.push('  · ' + e.file + ' 不存在 ⇒ 请从 H1_EXCEPTIONS 删掉'); continue; }
+  const h1n = headingsOf(fs.readFileSync(p, 'utf8').split(/\r?\n/)).filter((h) => h.lv === 1).length;
+  if (h1n <= 1) staleExceptions.push('  · ' + e.file + ' 现在只有 ' + h1n + ' 个一级标题 ⇒ 例外已无必要，请从 H1_EXCEPTIONS 删掉');
+}
+ok(staleExceptions.length === 0, '例外表无陈旧项（登记 ' + H1_EXCEPTIONS.length + ' 条）');
+
+/* ---------- v10.40 新增：版本日志迁移后的四项守卫 ----------
+ * 背景：39 份日志从根目录迁到 `docs/versions/`，并去掉 `CODEX-DONE-` 前缀，
+ *       同时把「纯文本提及」改成可点击链接。这四条守的都是**坏了不报错**的形态。 */
+console.log('');
+console.log('--- v10.40 版本日志守卫 ---');
+
+/* ① 根目录不得回潮出现 CODEX-DONE-*.md */
+const RE_OLDNAME = /^CODEX-DONE-.*\.md$/i;
+const rootOld = fs.readdirSync(ROOT).filter((f) => RE_OLDNAME.test(f));
+ok(rootOld.length === 0, '根目录无 CODEX-DONE-*.md（回潮 ' + rootOld.length + ' 个' +
+  (rootOld.length ? '：' + rootOld.slice(0, 4).join(', ') : '') + '）');
+
+/* ② docs/versions 下也不得有（只搬文件不改名会漏掉这一半） */
+const logAbs = path.join(ROOT, LOG_DIR);
+const logOld = fs.existsSync(logAbs) ? fs.readdirSync(logAbs).filter((f) => RE_OLDNAME.test(f)) : [];
+ok(logOld.length === 0, LOG_DIR + ' 下无 CODEX-DONE-*.md（实测 ' + logOld.length + ' 个）');
+
+/* ③ 全仓不得残留「活引用」形态：反引号包裹的具体旧文件名。
+ *    ★ 判据收窄到**具体文件名**（含数字版本号），因为规范说明里会出现 `CODEX-DONE-v*.md`
+ *      这类通配写法 —— 那不是活引用，不该报。 */
+const RE_LIVE_REF = /`CODEX-DONE-v\d+\.\d+\.md`/;
+const liveRefs = [];
+for (const d of docs) {
+  const s = fs.readFileSync(d.abs, 'utf8');
+  if (RE_LIVE_REF.test(s)) liveRefs.push(d.rel);
+}
+ok(liveRefs.length === 0, '无 `CODEX-DONE-v<版本>.md` 活引用（残留 ' + liveRefs.length +
+  ' 个' + (liveRefs.length ? '：' + liveRefs.slice(0, 4).join(', ') : '') + '）');
+
+/* ④ docs/versions 版本号必须连续、且每个文件的 H1 与自己的版本号一致。
+ *    H1 对不上是最阴的一种：文件叫 v10.39、标题写着 v10.38（复制模板忘改），
+ *    人眼扫索引时看不出来，但会让「按标题找版本」全线错位。 */
+const verFiles = fs.existsSync(logAbs)
+  ? fs.readdirSync(logAbs).filter((f) => RE_VER_LOG.test(f))
+  : [];
+const minis = verFiles.map((f) => Number(RE_VER_LOG.exec(f)[1])).sort((a, b) => a - b);
+const gaps = [];
+for (let v = minis[0]; v <= minis[minis.length - 1]; v++) if (!minis.includes(v)) gaps.push(v);
+ok(minis.length > 0 && gaps.length === 0,
+  LOG_DIR + ' 版本号连续（' + minis.length + ' 份，v10.' + minis[0] + ' → v10.' + minis[minis.length - 1] +
+  (gaps.length ? '，缺：v10.' + gaps.join(' / v10.') : '，无缺号') + '）');
+
+const h1Mismatch = [];
+for (const f of verFiles) {
+  const v = RE_VER_LOG.exec(f)[1];
+  const txt = fs.readFileSync(path.join(logAbs, f), 'utf8');
+  const h1 = (headingsOf(txt.split(/\r?\n/)).filter((h) => h.lv === 1)[0] || {}).t || '';
+  if (!new RegExp('^v10\\.' + v + '\\b').test(h1)) h1Mismatch.push(f + ' → 「' + h1.slice(0, 30) + '」');
+}
+ok(h1Mismatch.length === 0, '每份日志的 H1 与文件名版本号一致（不符 ' + h1Mismatch.length +
+  ' 个' + (h1Mismatch.length ? '：' + h1Mismatch.slice(0, 3).join(' ｜ ') : '') + '）');
+
+/* ⑤ 所有 .md 里的相对链接目标必须存在。
+ *    ★ 这条是「挪完文件改完引用」的收口判据：迁移时漏改一处引用，
+ *      原先的纯文本形态**不会报错**（本来就不可点），改成链接后才会露出来。
+ *      所以既要改（可点击），也要有这一条来证明**改对了**。 */
+const badLinks = [];
+for (const d of docs) {
+  const s = stripCode(fs.readFileSync(d.abs, 'utf8'));
+  const dir = path.dirname(d.abs);
+  const rx = /\]\(([^)\s]+)\)/g;
+  let m;
+  while ((m = rx.exec(s))) {
+    let t = m[1].trim();
+    if (/^(https?:|mailto:|tel:|data:|#)/i.test(t)) continue;   // 外链 / 锚点不查
+    t = t.split('#')[0];
+    if (!t) continue;
+    let dec = t;
+    try { dec = decodeURIComponent(t); } catch (e) { /* 原样 */ }
+    if (!fs.existsSync(path.resolve(dir, dec))) badLinks.push(d.rel + ' → ' + t);
+  }
+}
+ok(badLinks.length === 0, 'md 相对链接全部可解析（失效 ' + badLinks.length +
+  ' 处' + (badLinks.length ? '：' + badLinks.slice(0, 4).join(' ｜ ') + ' …' : '') + '）');
+
+/* ---------- v10.42 新增：版本索引收敛后的四条守卫 ----------
+ * 背景：`CODEX-INDEX.md` 已移除 —— 它顶部那个引用块里有 **42 个版本摘要块**（v10.1→v10.41 全覆盖），
+ *       而 README 顶部有 **34 个同款块**（还少 v10.11~v10.17 七版）：同一批摘要写了两次，
+ *       各自漂移，谁也说不清「哪一份才是该看的」。⇒ 索引职责收敛到 `docs/versions/`。
+ *       README 同时从「往上长」改成「项目说明在前 + 最近 5 版摘要」（原版唯一 H1 被挤到第 2011 行）。
+ * 这四条守的都是**坏了不报错**的形态。 */
+console.log('');
+console.log('--- v10.42 版本索引收敛守卫 ---');
+
+/* ① 已移除的文件不得回潮 */
+ok(!fs.existsSync(path.join(ROOT, 'CODEX-INDEX.md')),
+  '根目录无 CODEX-INDEX.md（v10.42 移除：它的版本块与 README 的重复）');
+
+/* ② 活文档里不得再把 CODEX-INDEX.md 当索引来**指路**。
+ *    ★ 三次收窄，缺一个都会误报：
+ *      ① 跳过 `docs/versions/v*.md` —— 那是**历史留档**，里面如实记着当时的做法；
+ *      ② 逐行忽略「它已经没了」的句子（含「已移除 / 已废弃 / 已收敛 / 不再使用」）；
+ *      ③ ★ **判据只判「指路」形态，不判「符号出现过」**（v10.42 实测踩到）：
+ *         README 的 changelog 必须如实写「本版移除了 `CODEX-INDEX.md`」，还会有
+ *         「它曾有过 41 个版本块」「旧文件可从某个 sha 取出」这类叙述 ——
+ *         按「符号出现过」判会把 changelog 一起判红，等于逼人不写原因（本项目的假绿老毛病）。
+ *         所以收窄成两种真·指路形态：**指针词 + 文件名**，或**以文件名开头的表格行**。
+ *    ★ 收窄后仍能抓住设计中的回归（见 `tools/_counterproof-v1042.js` ⑧ / ⑪ 两个变异）。 */
+const CidxPointer = /(见|看|详见|参见|参考|依据|索引|入口|查阅)\s*[：:，,、]?\s*[（(]?\s*`?CODEX-INDEX\.md/;
+const CidxTableKey = /^\s*\|\s*`?CODEX-INDEX\.md`?\s*\|/;
+const cidxLive = [];
+for (const d of docs) {
+  if (d.rel.startsWith(LOG_DIR + '/')) continue;
+  const raw = fs.readFileSync(d.abs, 'utf8').split(/\r?\n/);
+  let fence = null;
+  raw.forEach((l, i) => {
+    const f = /^(`{3,}|~{3,})/.exec(l.trim());
+    if (f) { const m = f[1][0]; if (fence === null) fence = m; else if (fence === m) fence = null; return; }
+    if (fence !== null) return;
+    if (!l.includes('CODEX-INDEX.md')) return;
+    if (/已移除|已删除|已废弃|已收敛|不再使用/.test(l)) return;
+    if (!CidxPointer.test(l) && !CidxTableKey.test(l)) return;
+    cidxLive.push(d.rel + ' L' + (i + 1) + '：' + l.trim().slice(0, 56));
+  });
+}
+ok(cidxLive.length === 0, '活文档里无「把 CODEX-INDEX.md 当索引」的活引用（命中 ' + cidxLive.length +
+  ' 行' + (cidxLive.length ? '：' + cidxLive.slice(0, 3).join(' ｜ ') : '') + '）');
+
+/* ★★ 判据自检（防止上面那次收窄把判据收成**恒真**）：
+ *    正样本必须命中、负样本必须放过 —— 两边都测，否则「宁可不报」的收窄没人挡得住。 */
+const CidxSelfPos = [
+  '> 版本索引见 `CODEX-INDEX.md`。',
+  '版本索引：CODEX-INDEX.md',
+  '| `CODEX-INDEX.md` | ★★ **版本索引** | 每版 |',
+  '- 详见 CODEX-INDEX.md',
+];
+const CidxSelfNeg = [
+  '### ★ v10.42 增量（2026-09-28）—— 文档收敛：移除 `CODEX-INDEX.md`、README 去重',
+  '`CODEX-INDEX.md` 有 **41 个**版本块（v10.1 → v10.41，无缺号，占 L211–L1854），',
+  '历史不丢：`CODEX-INDEX.md` 亦可从 `4b8ab0e` 取出。',
+];
+const cidxPos = CidxSelfPos.filter((l) => CidxPointer.test(l) || CidxTableKey.test(l));
+const cidxNeg = CidxSelfNeg.filter((l) => CidxPointer.test(l) || CidxTableKey.test(l));
+ok(cidxPos.length === CidxSelfPos.length && cidxNeg.length === 0,
+  'CODEX-INDEX 判据自检：正样本 ' + cidxPos.length + '/' + CidxSelfPos.length +
+  ' 命中、负样本 ' + cidxNeg.length + ' 误报' + (cidxNeg.length ? '（' + cidxNeg[0].slice(0, 40) + '）' : ''));
+
+/* ③ README 不许再「往上长」。
+ *    历史事故：2,854 行里前 1,978 行是 34 个版本摘要块，
+ *    `# GameHub 游讯聚合（机地 × XDGAME）` 被压到**第 2011 行** —— 访客打开首页
+ *    看不到「这个项目是什么」。
+ *
+ *    ★★ v10.100 口径变更（用户：「readme 尽量精简」）：版本摘要在 README 里**一块都不留**，
+ *       全部收进 `docs/versions/`（那里才是版本真源）。所以判据从「块数 ≤ 6 且排在 H1 之后」
+ *       改成「块数 = 0 且 H1 在 L1」，并配两条正向锚点 —— 光写「没有版本块」会被
+ *       「整份 README 被删空」满足（同族：铁律 181/190）。
+ *    ⚠️ 别把这条改回 `rBlocks.length > 0`：那样只要有人往 README 塞一块历史摘要，
+ *       就等于宣布「版本摘要回到 README」的口径复活，而 docs/versions 会跟着漂。 */
+const readmeTxt = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+const rHeads = headingsOf(readmeTxt.split(/\r?\n/));
+const rH1 = rHeads.filter((h) => h.lv === 1);
+const rBlocks = rHeads.filter((h) => /v\d+\.\d+\s*增量/.test(h.t));
+ok(rBlocks.length === 0,
+  'README 不含版本摘要块（版本史只在 docs/versions；实测 ' + rBlocks.length + ' 块'
+  + (rBlocks.length ? '：' + rBlocks.map((h) => h.t.slice(0, 10)).join(', ') : '') + '）');
+ok(rH1.length === 1 && rH1[0].ln === 1,
+  'README 的一级标题在第 1 行（项目说明必须在最前，实测 L' + (rH1[0] ? rH1[0].ln : '?') + '）');
+/* 正向锚点：精简 ≠ 删空。README 必须还能回答「是什么 / 怎么跑 / 这版是什么」。 */
+ok(/## 当前版本/.test(readmeTxt) && /docs\/versions\/v10\.\d+\.md/.test(readmeTxt),
+  'README 有「当前版本」段并链到该版日志（否则「没有版本块」会被「整份删空」满足）');
+ok(/## 快速开始/.test(readmeTxt) && /npm start/.test(readmeTxt),
+  'README 保留「快速开始」（能直接跑起来的那几行）');
+
+/* ④ 索引表与版本日志文件不许漂移（一边加了、另一边忘了，两边都看不出来） */
+const idxTxt = (() => { try { return fs.readFileSync(path.join(logAbs, 'README.md'), 'utf8'); } catch (e) { return ''; } })();
+const idxRows = (idxTxt.match(/^\|\s*\[v10\.\d+\]\(v10\.\d+\.md\)/gm) || []).length;
+ok(idxRows > 0 && idxRows === verFiles.length,
+  LOG_DIR + '/README.md 索引行数与日志文件数一致（索引 ' + idxRows + ' / 文件 ' + verFiles.length + '）');
+
+/* ---------- 汇总 ---------- */
+console.log('--- 逐项 ---');
+for (const l of okList) console.log(l);
+for (const l of badList) console.log(l);
+if (findings.length) {
+  console.log('');
+  console.log('--- 结构问题明细 ---');
+  for (const l of findings) console.log(l);
+}
+if (staleExceptions.length) {
+  console.log('');
+  console.log('--- 陈旧例外 ---');
+  for (const l of staleExceptions) console.log(l);
+}
+console.log('');
+console.log('====');
+console.log('通过 ' + pass + '/' + (pass + fail) + '（失败 ' + fail + '）');
+process.exit(fail ? 1 : 0);
+
+/* ---------- 标定依据（2026-09-24 实测） ----------
+ * · 健康态：47 个根目录 .md 全部通过；最高偏移重复 1.8%（CODEX-TASKS.md @ 偏移 334 行）——
+ *   来源是文档里本来就允许的重复表格分隔行、重复的命令行注释。
+ *   ⇒ 只统计**非平凡行**（trim 后 ≥ 12 字）+ 门槛 60%，与健康态拉开 30 倍以上余量。
+ * · 事故态：WORKFLOW.md 752 行版本，偏移 336 行处重复占比 ≈ 99%（同一份文档被整份插入）。
+ * · 门槛取 60% 而非 100%：副本可能被**编辑过**（事故里那条表行就被劈成两半、
+ *   标题被挤进行尾），所以不能要求逐字全同 ⇒ 留余量。
+ * · 首版判据的两处假红（已修，留作教训）：
+ *   ① 「一级标题恰好 1 个」把**围栏代码块里的 `#` 注释**当标题 ⇒ WORKFLOW.md 被算成 24 个、
+ *      README.md 被算成 2 个 ⇒ 必须先跳过 ``` / ~~~ 块。
+ *   ② 「标题文本唯一」太严 ⇒ docs/versions/v10.5.md 的 `### 修法` ×3、README.md 的 `### 验证` ×2
+ *      都是**不同父节下的同名子节**，完全合法 ⇒ 改成「标题**路径**唯一」。
+ */

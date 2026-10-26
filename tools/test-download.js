@@ -1,0 +1,528 @@
+/* 「下载链接」链路的常驻防线（v10.22 新增）
+ *
+ * 覆盖三块**新写、且都出过错**的东西：
+ *   ① fetchers/download.js —— XD 的 302 解析 + 机地帖子链接（Location 头乱码、版本串正则）
+ *   ② data/jiditopics.js  —— 机地全量话题库读取层（17,220 条）
+ *   ③ 前端下载弹窗的**接线**（.dlpop 的层级、三页是否都带上、入口按钮是否存在）
+ *
+ * ★ 为什么必须有：这三块都是「静默出错」型 ——
+ *   · host 键没归一 → 打到另一个站 → 只报一句 HTTP 404，看不出是键的问题
+ *     （本版实测踩到：parseDetailUrl 给 `xdgame.com`，而 XD_HOSTS 的键是 `xdgame`，
+ *      于是静默退到 xdgamer.com，那个站根本没有这个 id）
+ *   · 弹窗 z-index 低于详情抽屉 → 从抽屉里点开会被整个盖住，
+ *     而「元素存在 / 占版面 / 可点」全部成立 —— 最危险的那类假绿
+ *   · 派生页没重建 → 首页有弹窗、手机专区与解包页没有，且两边都不报错
+ *
+ * 纯本地、无网络、无副作用（不请求任何接口）。
+ */
+const fs = require('fs');
+const path = require('path');
+
+const ROOT = path.join(__dirname, '..');
+const dl = require('../fetchers/download');
+const jt = require('../data/jiditopics');
+const match = require('../data/spec-match');
+
+let pass = 0, fail = 0;
+const ok = (cond, name, detail) => {
+  if (cond) { pass++; console.log('  PASS  ' + name + (detail ? '  — ' + detail : '')); }
+  else { fail++; console.log('  × FAIL  ' + name + (detail ? '  — ' + detail : '')); }
+};
+const eq = (got, want, name) => ok(got === want, name, '得到 ' + JSON.stringify(got) + '，期望 ' + JSON.stringify(want));
+
+const read = (p) => fs.readFileSync(path.join(ROOT, p), 'utf8');
+
+/* ============================================================
+ *  ① XD 主机名归一 —— 本版实测踩到的真 bug
+ * ============================================================ */
+console.log('=== ① XD 主机名归一（parseDetailUrl 给的是 hostname，XD_HOSTS 的键是短名）===');
+eq(dl.normHost('xdgame'), 'xdgame', '短名 xdgame 原样通过');
+eq(dl.normHost('xdgame.com'), 'xdgame', '★ hostname `xdgame.com` 归一成 xdgame（不归一会静默打到 xdgamer.com）');
+eq(dl.normHost('www.xdgame.com'), 'xdgame', '带 www. 前缀也归一');
+eq(dl.normHost('https://www.xdgame.com/game/1.html'), 'xdgame', '整条 URL 也能归一');
+eq(dl.normHost('XDGAME.COM'), 'xdgame', '大小写不敏感');
+eq(dl.normHost('xdgamer'), 'xdgamer', '短名 xdgamer 原样通过');
+eq(dl.normHost('www.xdgamer.com'), 'xdgamer', 'xdgamer.com 归一成 xdgamer');
+eq(dl.normHost(''), null, '空串返回 null（不瞎猜，由调用方兜底）');
+eq(dl.normHost('evil.com'), null, '白名单外的域名返回 null');
+eq(dl.normHost('xdgame.com.evil.com'), null, '★ 后缀伪装域名不许通过（不是 includes 判定）');
+ok(Object.prototype.hasOwnProperty.call(dl.XD_HOSTS, 'xdgame') &&
+  Object.prototype.hasOwnProperty.call(dl.XD_HOSTS, 'xdgamer'),
+  'XD_HOSTS 同时有 xdgame 与 xdgamer 两个键（两套平行站，不能只留一个）');
+
+/* ============================================================
+ *  ② Location 头乱码修复
+ * ============================================================ */
+console.log('\n=== ② Location 头 latin1↔utf8 乱码 ===');
+const REAL = 'https://cloud.189.cn/t/vuaiQfq2iMjq（访问码：2o8s）';
+const MOJI = Buffer.from(REAL, 'utf8').toString('latin1');
+eq(dl.fixMojibake(MOJI), REAL, '★ 把被按 latin1 解码的 Location 还原回原文（含中文访问码）');
+ok(!/\uFFFD/.test(dl.fixMojibake(MOJI)), '还原结果里不许出现替换字符 U+FFFD');
+eq(dl.fixMojibake(REAL), REAL, '★ 已经是合法 UTF-8 的串必须原样返回（去掉 U+FFFD 判据就会在这里二次损坏）');
+eq(dl.fixMojibake('https://pan.baidu.com/s/1abc?pwd=b4s5'), 'https://pan.baidu.com/s/1abc?pwd=b4s5',
+  '纯 ASCII URL 原样返回');
+eq(dl.fixMojibake(null), '', 'null 安全降级为空串');
+eq(dl.fixMojibake(undefined), '', 'undefined 安全降级为空串');
+
+console.log('\n=== ②-b 访问码 / 提取码拆分 ===');
+eq(dl.splitPwd('https://pan.baidu.com/s/1x?pwd=b4s5').pwd, null, 'URL 自带 ?pwd= 时不当成访问码（内嵌 query 不动）');
+eq(dl.splitPwd(REAL).url, 'https://cloud.189.cn/t/vuaiQfq2iMjq', '中文括号里的访问码从 URL 上剥掉');
+eq(dl.splitPwd(REAL).pwd, '访问码：2o8s', '访问码原样取出给前端展示');
+eq(dl.splitPwd('https://pan.xunlei.com/s/abc').pwd, null, '无访问码时返回 null');
+
+/* ============================================================
+ *  ③ XD 详情页解析（纯函数，吃 HTML 字符串）
+ * ============================================================ */
+console.log('\n=== ③ XD 详情页 .article-down 解析 ===');
+const XD_HTML = `<html><head><title>t</title></head><body>
+<div class="article-tit"><h1>妈妈，我真的在学外语<small>SLG</small></h1></div>
+<div class="article-down"><ul>
+  <li><a class="downbtn normal" data-url="/plus/download.php?open=2&amp;id=15990&amp;uhash=aaa" data-server="百度网盘">百度网盘</a></li>
+  <li><a class="downbtn normal" data-url="/plus/download.php?open=2&amp;id=15990&amp;uhash=bbb" data-server="天翼网盘">天翼网盘</a></li>
+  <li><a class="downbtn normal" data-url="/plus/download.php?open=2&amp;id=15990&amp;uhash=ccc" data-server="迅雷网盘">迅雷网盘</a></li>
+  <li><a class="downbtn normal" data-url="/plus/download.php?open=2&amp;id=15990&amp;uhash=ddd" data-server="夸克网盘">夸克网盘</a></li>
+  <li><a class="downbtn normal" data-url="/plus/download.php?open=2&amp;id=15990&amp;uhash=eee" data-server="移动网盘">移动网盘</a></li>
+  <li><a class="downbtn normal" data-url="/plus/download.php?open=2&amp;id=15990&amp;uhash=fff" data-server="正版购买">正版购买</a></li>
+</ul></div>
+<h4>版本介绍</h4><p>Build.25183906|容量1.6GB|官方简体中文|支持键盘.鼠标</p>
+</body></html>`;
+const p = dl.parseXdDown(XD_HTML, 'https://www.xdgame.com');
+eq(p.items.length, 6, '★ 6 个盘口一个不漏');
+eq(p.items[0].serverUrl, 'https://www.xdgame.com/plus/download.php?open=2&id=15990&uhash=aaa',
+  '相对 data-url 拼成绝对地址，且 &amp; 已还原成 &');
+eq(p.items[0].server, '百度网盘', 'data-server 透传为盘口名');
+eq(p.version, 'Build.25183906|容量1.6GB|官方简体中文|支持键盘.鼠标',
+  '★ 版本串按「<h4>版本介绍</h4><p>…</p>」定位（去找「版本：」这三个字在原文里根本不存在）');
+eq(p.title, '妈妈，我真的在学外语', '标题取 .article-tit h1，并剥掉里面的 <small> 徽标');
+ok(p.items.every((x) => x.real === null && x.kind === 'downbtn'),
+  '解析阶段不带 real（真实地址要靠跟 302 拿），且标了来源 kind');
+
+/* 兜底：页面结构改名时从全文捞 Build.xxx|… */
+const p2 = dl.parseXdDown('<body><p>Build.26100000|容量2GB|官方中文</p></body>', 'https://www.xdgame.com');
+eq(p2.version, 'Build.26100000|容量2GB|官方中文', '结构变化时退到全文捞 `Build.<数字>|` 那一串');
+
+console.log('\n=== ③-b 网盘识别与入口 ===');
+eq(dl.serverOf('https://pan.quark.cn/s/3faa'), '夸克网盘', '夸克链接识别');
+eq(dl.serverOf('https://store.steampowered.com/app/1/'), '其他链接',
+  'Steam 商店不在网盘表里 —— 盘口名由 data-server 给，不靠 URL 猜');
+(async () => {
+  let threw = null;
+  try { await dl.resolve({ source: 'bogus', id: '1' }); } catch (e) { threw = e.message; }
+  ok(threw && /不支持的来源/.test(threw), 'resolve 遇到未知 source 明确报错，不静默返回空');
+
+  /* ============================================================
+   *  ③-c 源站权限门（XD 对部分游戏返回 200 +「你没有权限下载」）
+   *
+   *  ★ 这一段全部**离线**：线上验它需要恰好挑中一款被锁的游戏，数据一更新就验不到了。
+   *    但它恰恰是「弹窗里 0 条链接」时唯一的解释来源 —— 解释没了，用户只能以为本站坏了。
+   * ============================================================ */
+  console.log('\n=== ③-c 源站权限门（200 +「你没有权限下载」）===');
+  const AUTH_HTML = '<html><head><title>你没有权限下载：钢铁雄心4/Hearts of Iron IV！</title></head>'
+    + '<body><div class="err">你没有权限下载：钢铁雄心4/Hearts of Iron IV！</div></body></html>';
+  ok(dl.NEED_AUTH_RE.test(AUTH_HTML), '★ 能识别权限页（按标题/正文的「你没有权限下载」）');
+  ok(dl.NEED_AUTH_RE.test('<div>请先登录后再下载</div>'), '识别变体：请先登录');
+  ok(!dl.NEED_AUTH_RE.test(XD_HTML), '★ 正常详情页不能被误判为权限页（否则好游戏也提示去登录）');
+  ok(!dl.NEED_AUTH_RE.test('下载失败，请稍后重试'), '「稍后重试」类提示不能当成权限门（两者出口不同）');
+
+  /* 整组判定：三个条件缺一不可 */
+  ok(dl.needAuthOf([{ real: null, needAuth: true }, { real: null, needAuth: true }]) === true,
+    '★ 全部盘口都报权限 → needAuth 成立');
+  ok(dl.needAuthOf([{ real: 'https://pan.baidu.com/s/1' }, { real: null, needAuth: true }]) === false,
+    '★ 只要有一条解得出来，就不能弹「要登录」（否则把能给的结果也藏了）');
+  ok(dl.needAuthOf([{ real: null, error: 'HTTP 502' }, { real: null, error: 'HTTP 502' }]) === false,
+    '★ 全是网络错误 ≠ 权限门 —— 应引导「稍后重试」而不是「去登录」');
+  ok(dl.needAuthOf([]) === false, '空列表不是权限问题（是根本没解析出盘口）');
+  ok(dl.needAuthOf(null) === false, '非数组入参不炸');
+
+  /* ============================================================
+   *  ④ 机地全量话题库读取层
+   * ============================================================ */
+  console.log('\n=== ④ 机地全量话题库（data/jiditopics.js）===');
+  const st = jt.stats();
+  ok(st.ok === true, 'stats() 可读', st.error || '');
+  ok(st.total > 17000, '★ 全量话题数 > 17,000（老实现只有人工精选的 66 条）', '实测 ' + st.total);
+  ok(st.hasCover === st.total, '封面覆盖等于总数（封面是卡片版式的前提）', st.hasCover + '/' + st.total);
+  ok(st.hasAppid / st.total > 0.95, '★ appid 覆盖 > 95%（它是与 XD 精确对齐的唯一键）',
+    (st.hasAppid / st.total * 100).toFixed(1) + '%');
+  ok(st.hasMin > 16000, '最低配置覆盖 > 16,000（解包匹配的数据基座）', String(st.hasMin));
+  ok(st.hasDx > 7000, '★ DX 覆盖 > 7,000（曾经只有 2%，两个 bug 叠加的结果）', String(st.hasDx));
+  ok(st.downloadable > 300, '有可下载资源帖的话题 > 300', String(st.downloadable));
+
+  const hot = jt.list({ limit: 10 });      // 刻意**不传 sort**：验的就是默认值
+  ok(hot.ok === true && hot.items.length === 10, 'list() 返回 10 条');
+  eq(hot.sort, 'hot', '未指定 sort 时默认 hot（「可适配游戏优先推热门」的另一条出口）');
+  let desc = true;
+  for (let i = 1; i < hot.items.length; i++) if ((hot.items[i].dpv || 0) > (hot.items[i - 1].dpv || 0)) desc = false;
+  ok(desc, '★ 热度榜严格按 dpv 降序（排序键写错会静默给出一串乱序）',
+    hot.items.slice(0, 3).map((x) => x.title + ':' + x.dpv).join(' | '));
+  ok(hot.items[0].dpv > 100000, '热度榜首 dpv > 10 万（说明读的是真实浏览量而非占位 0）',
+    String(hot.items[0].dpv));
+
+  const dlOnly = jt.list({ dl: true, limit: 200 });
+  ok(dlOnly.ok && dlOnly.items.length > 0, 'dl=1 能筛出「有资源帖」的话题', String(dlOnly.items.length));
+  ok(dlOnly.items.every((x) => Number(x.modCnt) > 0), '★ dl=1 的结果里**每一条** modCnt 都 > 0（过滤器不许漏）');
+
+  const kw = jt.list({ q: '剑星', limit: 5 });
+  ok(kw.ok && kw.total >= 1, '关键词检索可用', '剑星 命中 ' + kw.total + ' 条');
+
+  /* ============================================================
+   *  ⑤ 解包匹配：热门优先 + 真实字段（对应「不要推断」「优先推热门」）
+   * ============================================================ */
+  console.log('\n=== ⑤ 解包匹配（data/spec-match.js）===');
+  const profile = {
+    arch: { raw: 'arm64-v8a' }, ram: { gb: 12 }, storage: { gb: 256 },
+    layer: { dxvk: '2.4', box64: '0.3.4' }, api: [],
+  };
+  const an = match.analyze(profile, { limit: 30 });
+  ok(an.ok === true, 'analyze 可跑', an.error || '');
+  eq(an.stats.sort, 'hot', '★ 不传 sort 时默认 hot（用户口径：可适配游戏优先推热门）');
+  ok(an.stats.scanned > 16000, '扫描 > 16,000 款（不再是 653 款的 Steam 单一源）', String(an.stats.scanned));
+  ok(/机地/.test(an.stats.source) && /Steam/.test(an.stats.source),
+    '★ 口径如实写明「机地 + Steam 官方，按 appid 合并」', an.stats.source);
+  const it0 = an.items[0];
+  ok(!!it0.cover, '★ 结果条目带封面（卡片版式的前提，没有就退化成纯文字列表）', String(it0.cover).slice(0, 52));
+  ok(it0.hot > 0, '结果条目带热度 hot', String(it0.hot));
+  ok(['jidi', 'steam', 'jidi+steam'].indexOf(it0.reqFrom) >= 0,
+    '★ 条目带 reqFrom（要求来自哪个源），前端才能如实标注而不是写「推断」', String(it0.reqFrom));
+  ok(it0.jidiTid || it0.libUrl, '条目至少带一个可取下载的入口（jidiTid / libUrl）',
+    'jidiTid=' + it0.jidiTid + ' libUrl=' + it0.libUrl);
+
+  const items = an.items.slice(0, 20);
+  let hotDesc = true;
+  for (let i = 1; i < items.length; i++) {
+    const a = items[i - 1], b = items[i];
+    if (match.ORDER[a.verdict] !== match.ORDER[b.verdict]) continue;   // 先按判定分组，组内才看热度
+    if ((b.hot || 0) > (a.hot || 0)) hotDesc = false;
+  }
+  ok(hotDesc, '★ 同判定组内按热度降序（组间按「流畅→可跑→…」排序，两者都不许乱）',
+    items.slice(0, 3).map((x) => x.name + ':' + x.hot).join(' | '));
+
+  /* 「流畅」只由内存余量决定：存储余量不许单独把游戏刷成流畅。
+     ★ 这一条是**反证过**的：把规则改回 `ramM >= 2 || stM >= 3`，本行立刻变红
+       （4GB 内存 ÷ 4GB 要求 = 1 倍，但 16GB 空间 ÷ 1GB = 16 倍，旧规则会判「流畅」）。 */
+  const tiny = match.judge(
+    { arch: { raw: 'x86_64' }, ram: { gb: 4 }, storage: { gb: 16 }, layer: {}, api: [] },
+    { ramGb: 4, storageGb: 1, dx: 9 });
+  eq(tiny.verdict, 'ok',
+    '★ 4GB 内存打 4GB 要求 → 「可跑」而不是「流畅」（存储余量大不叫跑得顺）');
+
+  /* ============================================================
+   *  ⑥ 前端接线：弹窗层级 / 三页齐备 / 入口按钮
+   * ============================================================ */
+  console.log('\n=== ⑥ 前端下载弹窗接线 ===');
+  const idx = read('public/index.html');
+  ok(/id="dlPop"/.test(idx), '主源有弹窗节点 #dlPop');
+  ok(/function openUniDownload/.test(idx) && /function closeDownload/.test(idx),
+    '主源有 openUniDownload / closeDownload');
+  /* ★ v10.45：下载弹窗**合并成一个**（四模块页签）。旧的两个入口随之删除 ——
+     删掉而不是留着：留着会让下一个人以为还有第二条路能走到「一次性铺全部专区」的老弹窗。 */
+  ok(!/function openDownload\s*\(/.test(idx) && !/function openModList\s*\(/.test(idx),
+    '★ 旧的 openDownload / openModList 已删除（合并版 openUniDownload 取代）');
+  ok(!/function setDlCounts\s*\(/.test(idx) && !/data-dlmod-open/.test(idx),
+    '★ 旧的 setDlCounts / data-dlmod-open 已清掉 —— 入口不再靠条数显隐');
+  ok(/data-dl-open/.test(idx), '主源有唤起入口 data-dl-open');
+  ok(/\.dlpop\{[^}]*z-index\s*:\s*(\d+)/.test(idx), '弹窗有 z-index 声明');
+
+  const zOf = (css, sel) => {
+    const m = new RegExp(sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\{[^}]*z-index\\s*:\\s*(\\d+)').exec(css);
+    return m ? Number(m[1]) : null;
+  };
+  const zPop = zOf(idx, '.dlpop');
+  const zDrawer = zOf(idx, '.drawer');
+  const zMask = zOf(idx, '.mask');
+  ok(zPop != null && zDrawer != null, '能取到弹窗与详情抽屉的 z-index',
+    'pop=' + zPop + ' drawer=' + zDrawer);
+  ok(zPop > zDrawer, '★★ 弹窗层级必须**高于详情抽屉**（否则从抽屉里点开会被整个盖住，而所有「存在性」断言照样绿）',
+    zPop + ' > ' + zDrawer);
+  ok(zPop > zMask, '弹窗层级高于遮罩 #mask', zPop + ' > ' + zMask);
+
+  /* ---- 四模块合并弹窗（★ v10.45） ---- */
+  ok(/id="dlModTabs"/.test(idx) && /class="dlmod" id="dlModTabs"/.test(idx),
+    '★ 弹窗外壳里有常驻的模块页签容器 #dlModTabs');
+  /* ⚠️ 页签条必须挂在 `.dlpop-h` 与 `.dlpop-b` 之间（弹窗的直接子节点）——
+     放进 .dlpop-b 会随内容滚走，滚到第 30 条就点不到「换模块」。
+     ★ v10.103：中间多了一条 #kmBar（本机下载器状态条），所以不能再写「页签后面 80 字内就是正文」。
+       改成**判顺序**：页签出现在正文容器之前，且正文容器全文只有一个。
+       判据强度不变 —— 页签在正文里的话，正文容器必然在它前面。 */
+  const iTabs = idx.indexOf('<div class="dlmod" id="dlModTabs"');
+  const iBody = idx.indexOf('<div class="dlpop-b" id="dlBody">');
+  ok(iTabs > 0 && iBody > iTabs,
+    '★★ 页签条在 .dlpop-b **之外**（放进去会跟着内容滚走，用户滚到一半就换不了模块）',
+    'tabs@' + iTabs + ' body@' + iBody);
+  ok(idx.indexOf('<div class="dlpop-b"') === iBody,
+    '反向：弹窗正文容器只有一个 .dlpop-b（两个就是嵌套了）');
+  ok(/id="dlBody"><\/div>/.test(idx), '正文容器初始为空（内容由 openUniDownload 填）');
+  ok(idx.indexOf('id="kmBar"') > 0 && idx.indexOf('id="kmBar"') < iBody,
+    '★ v10.103 下载器状态条同样在正文之外（和页签一样常驻，不随内容滚走）');
+  ok(/\.dlmod\{[^}]*border-bottom/.test(idx), '模块页签条有下边框（与内容区分开）');
+  ok(/\.dlm\.on\{/.test(idx), '有当前模块的高亮态 .dlm.on');
+  ok(/const DL_UNI = \[[\s\S]{0,160}?'body'[\s\S]{0,160}?'mod'[\s\S]{0,160}?'modifier'[\s\S]{0,160}?'save'/.test(idx),
+    '★ 四个模块顺序固定：本体 / Mod / 修改器 / 存档（顺序由一处常量定义，不散在各处）');
+  ok(/function dlGoModule\(/.test(idx), '有模块切换 dlGoModule()（只改状态再重绘，不重新取数）');
+
+  /* 入口：三个按钮合并成一个，且**不再带 hidden** */
+  ok(/class="ds ds-all"[^>]*id="dlBtn"[\s\S]{0,340}?data-dl-open/.test(idx),
+    '★ 详情页底部只有一个「⬇ 下载与资源」入口（v10.25 的三按钮 → v10.45 合一）');
+  ok(/\.ds-all\{/.test(idx), '有 .ds-all 样式（三色渐变，暗示这个入口管全部四类）');
+  /* ★★ 这条是本轮修复的**根因断言**：
+     旧实现的 .dl-strip 在「既无 d.url 又无 fb.jidiUrl」时整条 hidden，而三个按钮又各自
+     按 /api/download 的成败显隐 —— XD 要求登录的游戏（Skyrim SE）因此**连 Mod 都看不到**。 */
+  ok(/<div class="dl-strip" id="dlStrip">/.test(idx),
+    '★★ 下载动作条不再带 hidden —— 入口可见性不许由「本体能不能取到」决定（Skyrim 看不到 Mod 的根因）');
+  ok(/data-dl-url="\$\{esc\(d\.url/.test(idx), '下载按钮把当前源详情页 URL 传给弹窗');
+  ok(/data-dl-jidi="\$\{esc\(fb\.jidiUrl/.test(idx), '下载按钮把机地详情页 URL 也带上（双源一次取全）');
+  ok(/data-dl-id="\$\{esc\(fb\.id \|\| d\.id/.test(idx),
+    '入口把 libId 也传给弹窗（存档卡片那条链路要用它反查源站详情页）');
+  /* ★ v10.23：跨源那处的取值口径改了 —— 目标是机地时就是 hit.url；
+     目标是 XD 时机地详情页是**当前这一页**（d.url）。原先写死 hit.jidiUrl 只会取到空串。 */
+  ok(/jidiUrl: it\.jidiUrl/.test(idx)
+    && /jidiUrl: hitSource === 'jidi' \? hit\.url : \(d\.source === 'jidi' \? d\.url : ''\)/.test(idx),
+    '★ 三处 fb 兜底都补了 jidiUrl（列表行 / 热榜 / 搜索跨源），漏一处那条链路就取不到机地侧');
+
+  /* 四个模块**各自取数** —— 这是「不再连坐」的落地 */
+  ok(/async function dlUniFetchBody\(/.test(idx), '本体模块走 /api/download');
+  ok(/async function dlUniFetchMods\(/.test(idx) && /kind=' \+ kind/.test(idx) && /limit=' \+ D_MOD_CAP/.test(idx),
+    '★ Mod / 修改器各自按 kind 拉 /api/mods/match（条数不再由 /api/download 的成败决定）');
+  /* ★ v10.46：「存档」模块拆成**两条线** —— 文件（主区）与位置（右上角弹窗）。
+     旧的单一 dlUniFetchSave 已不存在 ⇒ 按铁律「搬家 + 反向断言」处理：
+     正向锚点证明新名字真的在，反向断言证明旧名字没有以死代码形式留下来。 */
+  ok(/async function dlUniFetchSaveFiles\(/.test(idx) && /\/api\/saves-yx\/match\?t=/.test(idx),
+    '★ 存档模块主区走 /api/saves-yx/match（游侠存档区的**可下载文件**）');
+  ok(/async function dlUniFetchSaveLoc\(/.test(idx) && /\/api\/saves\/match\?t=/.test(idx),
+    '★ 存档位置走 /api/saves/match（Ludusavi 路径库，哨兵口径：给的是「放哪」）');
+  ok(!/async function dlUniFetchSave\(/.test(idx),
+    '★★ 反向断言：旧的单一 dlUniFetchSave 已删除（拆成 Files / Loc，留着就是永不执行的死代码）');
+  /* ⚠️ v10.53：选择器由 `.dl-gcm{` 变成 `.dl-gcm,.dl-agg{`（GTrainers 段复用了同一套外壳，
+     两个「第三方段落」外观必须一致）。判据跟着放宽到「`.dl-gcm` 在某个选择器里」，
+     但不允许整个选择器消失 —— 否则 GCM 段会掉成裸块。 */
+  ok(/async function dlUniFetchGcm\(/.test(idx) && /\.dl-gcm[,\{]/.test(idx),
+    '★ 修改器模块另取 GCM 元数据并单独一段（它没有下载地址，不能长得像能点开的社区帖）');
+  ok(/function dlUniResolveItem\(/.test(idx) && /\/api\/library\/item\?id=/.test(idx),
+    '★ 只有 libId / 标题时先反查端游库拿详情页 —— 否则「本体」会误报「这条没有源站详情页」');
+  /* ★ 惰性加载：只加载当前页签，但三个便宜的先并行发出（本地索引，毫秒级） */
+  ok(/for \(const k of \['mod', 'modifier', 'save'\]\) dlUniLoad\(k\)/.test(idx),
+    '★ 打开弹窗时三个本地索引模块并行预热（页签条数尽快填上；最贵的 /api/download 留给当前页签）');
+  /* ★ v10.95：守卫拆成两句（`busy` 先判、`force` 才允许重取）—— 守的是
+     「切回已加载的页签不再打请求」这个行为，同时把「重试必须显式传 force」也钉住。 */
+  ok(/if \(!st \|\| st\.busy\[k\]\) return;/.test(idx) && /if \(st\.data\[k\] !== undefined && !force\) return;/.test(idx),
+    '★ 每个模块只取一次数（切回已加载的页签不再打请求；只有 force 重试才重取）');
+  ok(/box\.hidden = true; box\.innerHTML = ''/.test(idx),
+    '★ 关弹窗 / 打开「查看全部」子视图时把页签条藏掉（两套导航不许并存）');
+  ok(/function openDlSecPop\(/.test(idx) && /data-df-open/.test(idx),
+    '★ 详情页三专区预览的「全部 N 帖」入口仍走 openDlSecPop（没被合并版吃掉）');
+
+  /* ===== v10.46：存档 = 「文件」铺主区 + 「位置」收进右上角二级弹窗 =====
+   * 用户口径原文：「存档我需要的是文件，而不是文件位置，位置则在存档的右上角点击弹窗查看（可复制）」。 */
+  ok(/id="svLoc"/.test(idx) && /id="svLocBody"/.test(idx),
+    '★ 主源有 #svLoc 位置二级弹窗（位置不再铺在存档主区）');
+  ok(/\.svloc\{position:fixed[^}]*z-index:120/.test(idx),
+    '★★ .svloc 的 z-index 必须高于 .dlpop(110) —— 否则位置弹窗被下载弹窗整个盖住，'
+    + '而「节点存在 / 可点 / 占版面」全都成立（v10.22 同款最难发现的假绿）');
+  ok(/function dlUniPaintSave\(d\)/.test(idx) && /class="dl-sv-head"/.test(idx),
+    '★ 存档主区有标题行（文件数 + 右上角位置入口）');
+  ok(/data-dl-svloc="1"/.test(idx) && /closest\('\[data-dl-svloc\]'\)/.test(idx),
+    '★ 「📍 存档位置」按钮走**事件委托**（#dlBody 每次整块重建，直接绑监听必掉）');
+  ok(/'<a class="pri" href="' \+ esc\(f\.direct\)/.test(idx),
+    '★ 文件卡把**直链**做成主按钮（网盘再多也要有一个「直接下载」能点）');
+  ok(/function svfCard\(/.test(idx) && /去源站页面取 ↗/.test(idx),
+    '★ 解析不出任何下载通道的条目给「去源站页面取」出口 —— 不静默丢条');
+  /* ★★ 位置弹窗的版式断言必须**切出函数体再查**：`dl-sv-row` / `data-dl-copy` 这两串
+     在下载弹窗里到处都是，裸搜顶层源码等于恒真（断言名就会 over-claim）。 */
+  {
+    const i0 = idx.indexOf('function svLocHtml(');
+    const i1 = idx.indexOf('function openSvLoc(', i0);
+    const svBody = i0 >= 0 && i1 > i0 ? idx.slice(i0, i1) : '';
+    ok(/dl-sv-row/.test(svBody) && /data-dl-copy/.test(svBody) && /dl-sv-list/.test(svBody),
+      '★ 位置弹窗**函数体内**复用 .dl-sv-row + data-dl-copy（沿用旧版式，用户已经认这个版式）');
+    const o0 = idx.indexOf('async function openSvLoc(');
+    const o1 = idx.indexOf('function closeSvLoc(', o0);
+    const openBody = o0 >= 0 && o1 > o0 ? idx.slice(o0, o1) : '';
+    ok(/svLocHtml\(now\.loc \|\| null\)/.test(openBody),
+      '★ 位置弹窗画的是**本次会话的 loc 数据**（换游戏后不会画出上一款的路径）');
+  }
+  ok(/const sv = \$\('#svLoc'\)/.test(idx) && /sv\.addEventListener\('click'/.test(idx),
+    '★★ #svLoc 与 #dlPop 是**兄弟节点**，冒泡到不了下载弹窗的委托 —— '
+    + '复制 / 关闭必须自己接一遍（省掉后按钮长得一样但点了没反应）');
+  ok(/if \(sv && !sv\.hidden\) \{ e\.stopPropagation\(\); closeSvLoc\(\); return; \}/.test(idx),
+    '★★ ESC 先关最上面那一层 —— 否则在位置弹窗上按 ESC 会把下两层一起关掉');
+  ok(/closeSvLoc\(\);\s*\n\s*setTimeout\(\(\) => \{ pop\.hidden = true/.test(idx),
+    '★ 关下载弹窗时一并关位置弹窗（否则留下浮在空页面上的孤立卡片，且它 z-index 更高挡着点击）');
+  ok(/\$\('#dlFoot'\)\.innerHTML = '';/.test(idx),
+    '★ #dlFoot 是共享页脚，换页签先清 —— 否则存档那句「其中 N 条没能解析出下载通道」会跟到「本体」页签上');
+  /* ★ v10.53：角标 = 游侠文件 + **GTrainers 文件**（都出自 `data/res-groups.js` 的 saves 分区，
+     与卡面 `💾 N 存档` 同一个数）。仍然**只认文件**：位置条数在右上角弹窗里，加进来就是 over-claim。 */
+  ok(/st\.cnt\.save = files\.count \+ gts\.length;/.test(idx),
+    '★ 页签角标只认**文件数**（游侠 + GT；把位置条数加进来 = over-claim：显示 12 点进去只有 2 个能下载）');
+  /* ★★ 反向断言必须锚到**「加了哪些东西」**：v10.46 那版写的是「不许出现 `files.count + `」，
+     v10.53 起 `+ gts.length` 是**设计要的**，老判据会假红。
+     真正要守的不变量没变 —— **位置（loc）永远不许进角标**。 */
+  ok(!/st\.cnt\.save = [^;]*\bloc/.test(idx),
+    '★★ 反向断言：角标不再叠加**位置**条数（over-claim 回归会当场变红）');
+  ok(/await dlUniLoad\('save'\)/.test(idx)
+    && /for \(let i = 0; i < 40 && dlUni === st && st\.busy\.save; i\+\+\)/.test(idx),
+    '★★ 位置弹窗在数据未回时先兜底取数并**等 busy 落下** —— dlUniLoad 在加载中会直接 return，'
+    + '只 await 一次会把「还在读」误画成「Ludusavi 里没有这款游戏」（假空态比转圈更糟）');
+  ok(/function closeSvLoc\(/.test(idx) && /function openSvLoc\(/.test(idx),
+    '★ 位置弹窗有独立的开 / 关函数（复用 #dlPop 外壳的那批弹窗不能顺手把它一起带走）');
+  /* ★ v10.110：基数变量从 `items` 换成 `keep`（筛后的那一批）。
+     断言同步放宽成 `items|keep` —— 守的是「有上限 + 有出口」这个行为，
+     不是绑定哪个变量名。⚠️ 「展开基数必须是筛后集合」这条更强的约束
+     由 test-v10110-dl-filter.js 单独守，别在这里补第二份。 */
+  ok(/const SVF_CAP = 20;/.test(idx) && /\b(?:items|keep)\.slice\(0, SVF_CAP\)/.test(idx),
+    '★ 存档文件列表有上限 SVF_CAP（实测单款最多 215 条 —— 鬼谷八荒，全是真命中，全铺 DOM 太重）');
+  ok(/data-dl-svf="all">展开全部 ' \+ (?:items|keep)\.length/.test(idx) && /data-dl-svf="less"/.test(idx),
+    '★★ 截断必须**明说条数 + 给展开/收起出口** —— 静默丢条是本项目明令禁止的');
+  ok(/dlUni\.svfAll = sfv\.dataset\.dlSvf === 'all'/.test(idx) && /svfAll: false,/.test(idx),
+    '★ 展开态挂在会话对象上（换游戏 / 关弹窗自动重置，不会「上一款展开过这一款也全铺」）');
+
+  for (const page of ['public/emulator.html', 'public/resources.html', 'public/unpack.html']) {
+    const t = read(page);
+    ok(/id="dlPop"/.test(t) && /function openUniDownload/.test(t) && /id="dlModTabs"/.test(t),
+      '★ ' + page + ' 已重建并带上合并弹窗（改了主源不重建派生页，那边就没有弹窗且不报错）');
+    ok(/id="svLoc"/.test(t) && /function svLocHtml/.test(t) && /function svfCard/.test(t),
+      '★★ ' + page + ' 已重建并带上 v10.46 的「存档文件主区 + 位置弹窗」（少重建一页那页就还是纯路径）');
+  }
+
+  /* ★ 权限受限时的「说明 + 出口」必须真的接上去：
+     只改 JS 不加 CSS，块会渲染成一行没有边框的裸文字（存在性断言照样绿）。 */
+  ok(/function dlBlocked/.test(idx), '主源有 dlBlocked()（整组取不到时的说明块）');
+  ok(/\.dl-blocked\{/.test(idx), '★ .dl-blocked 有样式（否则说明块长得像加载失败的空壳）');
+  ok(/\.dl-blocked\{[^}]*background/.test(idx), '.dl-blocked 有底色（与正常行区分开）');
+  ok(/\.dl-go\{/.test(idx), '★ .dl-go 有样式（去源站的出口按钮）');
+  ok(/dlBlocked\('XDGAME 官方盘口'/.test(idx), '★ XD 组取不到时会走 dlBlocked，而不是整组消失');
+  ok(/needAuth/.test(idx) && /登录\s*\/\s*权限/.test(idx),
+    '★ 文案区分「源站要求登录 / 权限」与「解析失败」（前者重试一万次也没用）');
+  ok(/needAuth:\s*!!data\.needAuth/.test(read('server.js')),
+    '服务端把 needAuth 透传给前端（只看 items 里有没有 real，前端分不清「被锁」和「超时」）');
+
+  /* 解包页：结果卡片要跟手机专区同版式
+   * ★ v10.24 起判据收紧：**光有 `.emu-card` 类名不算「同版式」**。
+   *   v10.22 就是只借了类名，正文另起 `.top/.nm/.cnt` + 六个自定义区块，
+   *   卡片高 352px（手机专区 232px）—— 用户一眼看出不是同一套东西。
+   *   真正要守的是**正文骨架同构**：`.bd > h4 + .alt + .meta > .pill + .tgs > .tg`。
+   *   ⚠️ 断言一律**锚定到模板串**（`'<div class="bd">' +`），不裸搜类名 ——
+   *   注释里出现过同一串文字就会恒真（本项目栽过：PITFALLS 15/37）。 */
+  const up = read('public/unpack.html');
+  ok(/class="emu-grid up-list"/.test(up), '★ 解包结果容器复用手机专区的 .emu-grid 网格');
+  ok(/class="emu-card[^"]*up-mc/.test(up), '★ 结果卡片复用手机专区的 .emu-card 类名');
+  ok(/'<div class="bd">' \+/.test(up), '★ 卡片正文是 .bd 容器（与手机专区同构）');
+  ok(/'<h4 title="' \+ esc\(it\.name\)/.test(up), '★ 游戏名用 <h4>（手机专区同款标题位，不是自定义 .nm）');
+  ok(/'<div class="meta">' \+ pills \+/.test(up) && /'<div class="tgs">' \+ tags\.join/.test(up),
+    '★ 徽标行 / 标签行走手机专区同款 .meta > .pill 与 .tgs > .tg');
+  ok(!/'<div class="top">'/.test(up) && !/'<div class="nm">'/.test(up),
+    '★ 不再产出 v10.22 的 .top / .nm 正文（同一语义只留一套版式）');
+  ok(/'<span class="tg src">要求来自 '/.test(up), '★ 要求来源做成手机专区同款 .tg src 标签');
+  ok(!/\.up-badge\{/.test(up) && !/\.up-mc-src\{/.test(up) && !/\.up-mc-row\{/.test(up),
+    '★ 旧版式的死 CSS 已清掉（留着会让下一个人以为卡片还是旧版式）');
+  ok(/btn\('hot', '🔥 热门优先'/.test(up), '解包页有「🔥 热门优先」排序按钮');
+  ok(/sort: 'hot'/.test(up), '★ 解包页默认排序是 hot（不是规模优先）');
+  ok(/data-dl-open/.test(up), '★ 解包页卡片能直接唤起下载弹窗');
+  ok(/\.up-mc-btns\{/.test(up), '解包页有按钮行样式 .up-mc-btns');
+  ok(!/对照库：Steam 官方配置要求/.test(up), '★ 判定依据面板不再写死「Steam 官方配置要求 N 款」这种过期口径');
+
+  /* ============================================================
+   *  ⑦ 广告 / 帮助站链接清洗（★ v10.45 新增）
+   * ============================================================
+   * 用户口径：「游戏下载本体中 有个其他：元素为 <img src="//static2.52jidi.com/...
+   *           icon_from_xunlei_helper..."> 实际是一个广告链接，帮我清洗掉」。
+   * 实测那条 = `https://52leiqu.com/problemTutorial`（迅雷「雷区」问题教程页），
+   * 机地资源帖正文结尾的固定引导句。它既不是站内域名（INTERNAL_HOST_RE 管不到），
+   * 也不是任何网盘 ⇒ kind 退成 '其他链接' ⇒ 前端渲染成一个名叫「其他」的下载按钮。
+   * ★ 必须在**抽取阶段**丢 —— 前端隐藏只是把广告藏起来，库里那 34 处还在（详见 data/mods.json 清洗）。 */
+  console.log('\n=== ⑦ 广告 / 帮助站链接清洗 ===');
+  const shared = require('../shared');
+  ok(shared.JUNK_HOST_RE instanceof RegExp, 'shared 导出 JUNK_HOST_RE');
+  ok(shared.JUNK_HOST_RE.test('52leiqu.com') && shared.JUNK_HOST_RE.test('www.52leiqu.com'),
+    '★ 命中广告站 52leiqu.com（含子域写法）');
+  ok(!shared.JUNK_HOST_RE.test('52jidi.com') && !shared.JUNK_HOST_RE.test('pan.xunlei.com')
+    && !shared.JUNK_HOST_RE.test('leiqupan.com'),
+    '★★ 不误伤机地主站与真网盘域名（护栏写宽了会把正常资源一起吃掉，且界面看不出来）');
+  const ex = shared.extractLinks('如仍有问题，请看：https://52leiqu.com/problemTutorial 下载：https://pan.baidu.com/s/1abc'
+    + ' 另一帖 https://jidiyouxi.com/post/detail/1');
+  ok(ex.length === 1 && /pan\.baidu\.com/.test(ex[0].url),
+    '★★ 抽取阶段就丢掉广告链与站内链（只留真网盘）—— 不是靠前端 hide()',
+    JSON.stringify(ex.map((x) => x.url)));
+  /* 存量清洗：库里不许再有 52leiqu —— 抽取层修好只保证「新抓的干净」，
+     已经入库的那批必须靠 _clean-junk-links.js 摘掉（否则老数据继续渲染「其他」按钮）。 */
+  const modsJson = JSON.parse(read('data/mods.json'));
+  const junkLeft = (modsJson.items || []).reduce((n, it) =>
+    n + (it.links || []).filter((l) => /52leiqu/i.test(String((l && l.url) || ''))).length, 0);
+  ok(junkLeft === 0, '★★ data/mods.json 存量广告链已清空', '残留 ' + junkLeft + ' 条');
+
+  /* ---- ⑦b 「用户看得到的字段」必须比 links 更宽地清干净 ----
+   * ★ 为什么再加这一组：上面那条只查了 `links[]`。用户反馈的**本体下载弹窗**还有别的渲染出口
+   *   （条目 URL、标题），只守 `links` 会出现「links 清了、别处又漏出来」的缺口。
+   *   实测：`content`（帖子原文）里仍有 17 处 `52leiqu.com/problemTutorial` ——
+   *   它来自源帖自带的引导句，**目前服务端与前端一行都不读**（`data/mods.js` 只用它做截断说明），
+   *   所以用户看不到。但「今天不读」不等于「明天不读」⇒ 用一条判据把这个前提钉死：
+   *   一旦有人开始渲染 `content`，这条立刻变红，逼他先把广告站清掉再渲染。 */
+  const JUNK = /52leiqu/i;
+  let badUrl = 0, badTitle = 0;
+  for (const it of (modsJson.items || [])) {
+    if (JUNK.test(String(it.url || ''))) badUrl++;
+    if (JUNK.test(String(it.title || ''))) badTitle++;
+  }
+  ok(badUrl === 0 && badTitle === 0,
+    '★★ 可见字段（条目 url / 标题）也零残留 —— 不能只守 links[]',
+    `url ${badUrl} 条 / title ${badTitle} 条`);
+
+  const modsRead = read('data/mods.js');
+  const srvSrc = read('server.js');
+  let contentRendered = JUNK.test(modsRead) || JUNK.test(srvSrc);
+  for (const pg of ['public/index.html', 'public/resources.html', 'public/emulator.html', 'public/unpack.html']) {
+    if (JUNK.test(read(pg))) contentRendered = true;
+  }
+  ok(!contentRendered,
+    '★★ 广告站串不许出现在任何**渲染层**（mods 读取层 / 服务端 / 四张页面）');
+  /* ★★ v10.50：**前提已经变了** —— 原贴弹窗（`#postPop`）开始整段渲染 `content`。
+     下面这条原先钉的是「content 无人渲染」这个**前提**（拿 `.content` 字面量当代理判据），
+     它自己把条件写在了括号里：「前提变了就必须连带把 content 一起清」。
+     ⇒ 现在按新前提改写（既不是删掉，也不是想办法让它变绿）：
+        ① 渲染链路**确实在**（正向锚点 —— 防「把渲染删掉」也被判通过）；
+        ② 正文里的广告行在**数据层已清零**（这才是那条断言真正要保的东西）；
+        ③ 清洗**只有一份实现**，抽取层（入库前）与读取层（交出正文前）都调它。
+     ★ 变红的那个瞬间是**设计如此**：它逼着先清数据、再更新断言，两步都不能省。 */
+  const cleanPostText = shared.cleanPostText;
+  ok(typeof cleanPostText === 'function', '★ v10.50：shared 导出 cleanPostText（正文广告行清洗的唯一真源）');
+  {
+    const dirty = '介绍：这是一个 MOD\n\n使用方式：解压到游戏根目录\nd.如仍有问题，请看：https://52leiqu.com/problemTutorial。';
+    const out = cleanPostText(dirty);
+    ok(!/52leiqu/i.test(out) && /使用方式/.test(out) && /介绍/.test(out),
+      '★★ v10.50：cleanPostText 删掉含广告站的**整行**，其余正文一字不动', JSON.stringify(out));
+    const cleanTxt = '正文\n网盘 https://pan.xunlei.com/s/abc 提取码 1234';
+    ok(cleanPostText(cleanTxt) === cleanTxt, '★★ v10.50：无广告的正文**原样返回**（零改动、可反复调用）');
+    ok(cleanPostText('来自 https://leiqupan.com/s/x') === '来自 https://leiqupan.com/s/x',
+      '★★ v10.50 护栏：`leiqupan.com` 是**真网盘**，不许被误伤（判据走 host，不走「含 leiqu 字样」）');
+    ok(cleanPostText(cleanPostText(dirty)) === cleanPostText(dirty), '★ v10.50：清洗是幂等的');
+
+    let badContent = 0;
+    for (const it of (modsJson.items || [])) if (/52leiqu/i.test(String(it.content || ''))) badContent++;
+    ok(badContent === 0,
+      '★★ v10.50：data/mods.json 的**正文**广告串已清零（v10.45 只清了 links / url / title，正文是这次补的）',
+      '残留 ' + badContent + ' 条');
+
+    const jm = read('fetchers/jidiModify.js');
+    ok(/cleanPostText/.test(jm) && /cleanPostText/.test(read('data/res-groups.js')),
+      '★ v10.50：抽取层（入库前）与读取层（交出正文前）都过清洗 —— 双保险');
+    ok(!/content:\s*raw\.length/.test(jm),
+      '★★ v10.50 反向：抽取层不再把**未清洗的 raw** 直接写进 content（回到旧写法这条就红）');
+    ok(/\.content\b/.test(read('public/index.html')),
+      '★ v10.50 正向锚点：`content` 确实在渲染层 —— 本组断言由「无人渲染」正式改为「已渲染且已清洗」');
+  }
+
+  /* ============================================================
+   *  ⑧ 服务端路由存在性
+   * ============================================================ */
+  console.log('\n=== ⑧ 服务端路由 ===');
+  const srv = read('server.js');
+  ok(/app\.get\('\/api\/download'/.test(srv), '/api/download 路由存在');
+  ok(/app\.get\('\/api\/jiditopics\/stats'/.test(srv), '/api/jiditopics/stats 路由存在');
+  ok(/app\.get\('\/api\/jiditopics\/list'/.test(srv), '/api/jiditopics/list 路由存在');
+  ok(/require\('\.\/data\/jiditopics'\)/.test(srv), 'server.js 已引入机地话题库读取层');
+  ok(/parseDetailUrl\(rawUrl\)/.test(srv), '★ /api/download 优先用 url 解析（两套平行站同 id ≠ 同游戏）');
+
+  console.log('\n============================');
+  console.log('  通过 ' + pass + '/' + (pass + fail) + '（失败 ' + fail + '）');
+  console.log('============================');
+  process.exit(fail ? 1 : 0);
+})();

@@ -1,0 +1,20 @@
+{
+  "name": "gh-gamehub",
+  "version": "1.0.0",
+  "private": false,
+  "type": "commonjs",
+  "description": "GH-Gamehub：机地与 XDGAME 的游戏库、MOD、存档、修改器与手机模拟器配置聚合站。只做信息，不托管游戏文件。",
+  "scripts": {
+    "start": "node server.js",
+    "probe": "node probe.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "express": "^4.19.2",
+    "js-yaml": "^5.4.1"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1",
+    "puppeteer-core": "^25.10.0"
+  }
+}
