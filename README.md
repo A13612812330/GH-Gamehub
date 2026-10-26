@@ -1,6 +1,6 @@
 # GH-Gamehub · 单机游戏信息聚合站
 
-> 📚 **本文档属于 GH 系列交接项目。** 总入口（全部 10 个仓库索引、可用性实测、可复制的 AI Agent prompt）：https://github.com/A13612812330/GH-Handover
+> 📚 **本文档属于 GH 系列交接项目。** 总入口（全部 10 个仓库索引、可用性实测、可复制的 AI Agent prompt）：https://github.com/GHZS-Project/GH-Handover
 
 > **版本 V1** · 2026-10-26 打包 · 代码基线 `game-aggregator` v10.112（2026-10-23）
 >
@@ -50,7 +50,7 @@
 仓库根目录有 `.nvmrc`（`22.22.2`），装了 nvm 的话 `nvm use` 即可一次满足两档。
 
 ```bash
-git clone https://github.com/A13612812330/GH-Gamehub.git
+git clone https://github.com/GHZS-Project/GH-Gamehub.git
 cd GH-Gamehub
 npm install
 npm run doctor            # 接手自检：Node 版本 / 依赖 / 数据 / 端口 / 后台账号
