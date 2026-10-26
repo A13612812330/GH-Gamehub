@@ -38,15 +38,36 @@
 
 ## 快速开始
 
+**环境要求**（两档，别混）
+
+| 用途 | Node.js | 依据 |
+|---|---|---|
+| 只运行站点 / 浏览现有数据 | **≥ 20.18.1** | `cheerio@1.2` 的 engines |
+| 跑测试与抓取 | **≥ 22.22.2** | `jsdom@30` / `puppeteer-core@25` 的 engines |
+
+仓库根目录有 `.nvmrc`（`22.22.2`），装了 nvm 的话 `nvm use` 即可一次满足两档。
+
 ```bash
+git clone https://github.com/A13612812330/GH-Gamehub.git
+cd GH-Gamehub
 npm install
+npm run doctor            # 接手自检：Node 版本 / 依赖 / 数据 / 端口 / 后台账号
 npm start                 # 常驻 8123
 ```
+
+`npm run doctor` 只读，不装不改；有阻断项时退出码为 1，适合接进 CI 前置检查。
 
 Windows 也可双击 `启动聚合站.cmd`（前台看日志）或 `启动聚合站-静默.vbs`（无黑窗）。
 URL 直达：`/?q=剑星`（搜索）· `/?c=角色扮演`（分类）· `/?open=<id>&dl=mod`（详情并打开指定模块弹窗）。
 
+**首次使用后台**要先建账号（仓库里**故意不含**凭据文件）：
+
+```bash
+npm run admin:init -- <用户名> <密码>
+```
+
 每日 09:30 定时任务：XD 增量 → BannerHub 刷新 → 实测库重建 → 机地话题同步。
+
 
 ## 数据源
 

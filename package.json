@@ -4,8 +4,27 @@
   "private": false,
   "type": "commonjs",
   "description": "GH-Gamehub：机地与 XDGAME 的游戏库、MOD、存档、修改器与手机模拟器配置聚合站。只做信息，不托管游戏文件。",
+  "keywords": ["game-library", "aggregator", "scraper", "cheerio", "express", "gamehub"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/A13612812330/GH-Gamehub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/A13612812330/GH-Gamehub/issues"
+  },
+  "homepage": "https://github.com/A13612812330/GH-Gamehub#readme",
+  "engines": {
+    "node": ">=20.18.1"
+  },
   "scripts": {
     "start": "node server.js",
+    "doctor": "node tools/setup-check.js",
+    "handover": "node tools/setup-check.js --handover",
+    "test": "node tools/run-all.js",
+    "test:browser": "node tools/run-all.js --browser",
+    "test:sync": "node tools/test-pages-sync.js",
+    "admin:init": "node tools/set-admin-account.js",
     "probe": "node probe.js"
   },
   "dependencies": {
