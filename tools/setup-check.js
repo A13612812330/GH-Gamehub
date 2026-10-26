@@ -160,7 +160,12 @@ const browserHint = process.platform === 'win32'
     console.log('结论：全部通过。执行 npm start 后打开 http://localhost:' + PORT + ' 。');
   }
 
-  if (process.argv.includes('--handover')) {
+  /* ★ 阅读顺序只在**有 HANDOVER.md 的仓库**里提示：
+   *   开源交接库（GH-Gamehub）有这份文档，源仓库没有。
+   *   同一个脚本两处共用 ⇒ 提示必须自适应，不能无条件喊「npm run handover」
+   *   （源仓库既没有这个 npm 脚本、也没有那份文档，喊了就是误导）。 */
+  const hasHandover = fs.existsSync(path.join(ROOT, 'HANDOVER.md'));
+  if (process.argv.includes('--handover') && hasHandover) {
     console.log('\n接手阅读顺序');
     console.log('  1) HANDOVER.md   —— 架构分层（改哪里必须做什么）+ AI 技能清单 + 工具链索引');
     console.log('  2) README.md     —— 项目自述（注意 HANDOVER 第 9 节点名的过期数字）');
@@ -172,8 +177,8 @@ const browserHint = process.platform === 'win32'
     console.log('  npm test             静态防线 86 套，约 3~5 分钟');
     console.log('  npm run test:browser 追加浏览器实拍 14 套（一次只能跑一个）');
     console.log('  npm run test:sync    只验派生页与主源是否一致（58 条，约 2 秒）');
-  } else {
-    console.log('提示：npm run handover 可一并打印接手阅读顺序。');
+  } else if (hasHandover) {
+    console.log('提示：node tools/setup-check.js --handover 可一并打印接手阅读顺序。');
   }
   console.log('');
 
